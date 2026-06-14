@@ -29,7 +29,6 @@ from streamlit_folium import st_folium
 load_dotenv()
 
 from src import config
-from src.external import quintoandar as qa_api
 from src.external import zapimoveis
 from src.models.predict import carregar_metadata, carregar_modelo
 from src.search.engine import filtrar_por_poi, haversine_km
@@ -46,7 +45,6 @@ from src.search.query_parser import parse as parse_query
 _REFERER_MAP = {
     "zapimoveis":   "https://www.zapimoveis.com.br/",
     "vivareal":     "https://www.vivareal.com.br/",
-    "quintoandar":  "https://www.quintoandar.com.br/",
 }
 
 def _referer(url: str) -> str:
@@ -314,7 +312,6 @@ hr{border-color:rgba(255,255,255,.06)!important}
 .src-zap     {background:rgba(255,93,0,.18);color:#fb923c;border:1px solid rgba(251,146,60,.25)}
 .src-vivareal{background:rgba(124,58,237,.18);color:#a78bfa;border:1px solid rgba(167,139,250,.25)}
 .src-ml      {background:rgba(255,196,0,.18);color:#fbbf24;border:1px solid rgba(251,191,36,.25)}
-.src-qa      {background:rgba(0,191,165,.18);color:#2dd4bf;border:1px solid rgba(45,212,191,.25)}
 
 .price-pill{position:absolute;bottom:12px;right:12px;
   background:rgba(0,0,0,.78);backdrop-filter:blur(12px);
@@ -371,7 +368,6 @@ hr{border-color:rgba(255,255,255,.06)!important}
 .src-zap-badge     {background:rgba(255,93,0,.15);color:#fb923c}
 .src-vivareal-badge{background:rgba(124,58,237,.15);color:#a78bfa}
 .src-ml-badge      {background:rgba(255,196,0,.15);color:#fbbf24}
-.src-qa-badge      {background:rgba(0,191,165,.15);color:#2dd4bf}
 
 /* ══ WELCOME / EMPTY ══ */
 .welcome{text-align:center;padding:80px 20px 60px}
@@ -459,9 +455,8 @@ def _eval(preco: float, previsto: float):
 # ══════════════════════════════════════════════════════════════════════════
 
 _SRC_LABEL: dict[str, tuple[str, str]] = {
-    "zap":          ("ZAP Imóveis",  "src-zap"),
-    "vivareal":     ("Viva Real",    "src-vivareal"),
-    "quintoandar":  ("Quinto Andar", "src-qa"),
+    "zap":      ("ZAP Imóveis", "src-zap"),
+    "vivareal": ("Viva Real",   "src-vivareal"),
 }
 
 
@@ -705,7 +700,7 @@ def _buscar_tudo(
     quartos_min: int, preco_min: float, preco_max: float, area_min: float,
     query_raw: str = "",
     limit_por_fonte: int = 60,
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict]]:
     kw = dict(
         cidade=cidade, estado=estado, bairro="",
         tipos=tipos if tipos else ["apartment", "house"],
@@ -717,12 +712,11 @@ def _buscar_tudo(
         limit=limit_por_fonte,
     )
 
-    def _zap():   return zapimoveis.buscar_zap(**kw)
-    def _viva():  return zapimoveis.buscar_vivareal(**kw)
-    def _qa():    return qa_api.buscar(**kw)
+    def _zap():  return zapimoveis.buscar_zap(**kw)
+    def _viva(): return zapimoveis.buscar_vivareal(**kw)
 
     results: dict[str, list[dict]] = {}
-    fns = {"zap": _zap, "viva": _viva, "qa": _qa}
+    fns = {"zap": _zap, "viva": _viva}
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(fn): key for key, fn in fns.items()}
@@ -730,14 +724,13 @@ def _buscar_tudo(
             key = futures[future]
             try:
                 results[key] = future.result() or []
-            except Exception:
+            except Exception as _exc:
+                _log(f"[BUSCAR] Erro na fonte '{key}': {type(_exc).__name__}: {_exc}")
                 results[key] = []
 
     return (
         results.get("zap", []),
         results.get("viva", []),
-        results.get("qa", []),
-        [],
     )
 
 
@@ -752,10 +745,9 @@ def _init():
         "qp":             None,
         "buscou":         False,
         "bairro_busca":   "",
-        "zap_items":      [],
-        "viva_items":     [],
-        "qa_items":       [],
-        "api_status":     {},
+        "zap_items":  [],
+        "viva_items": [],
+        "api_status": {},
         "aviso_bairro":   "",
     }
     for k, v in defaults.items():
@@ -836,7 +828,7 @@ with st.sidebar:
 st.markdown("""
 <div class="hero">
   <div class="hero-title">Encontre seu imóvel ideal</div>
-  <div class="hero-sub">ZAP Imóveis · Viva Real · Quinto Andar · Previsão de preço por IA</div>
+  <div class="hero-sub">ZAP Imóveis · Viva Real · Previsão de preço por IA</div>
 </div>""", unsafe_allow_html=True)
 
 with st.form("busca_form", clear_on_submit=False, border=False):
@@ -903,7 +895,7 @@ if buscar_btn and query.strip():
             _buscar_pois_cached(lat, lon, int(raio_km * 1000 + 3000), tuple(sorted(pois_eff)))
         st.session_state.poi_locs = {}
 
-        zap_r, viva_r, qa_r_raw, _ = _buscar_tudo(
+        zap_r, viva_r = _buscar_tudo(
             cidade=cidade, estado=estado,
             tipos=tipos_eff,
             negocio=negocio_api,
@@ -913,29 +905,26 @@ if buscar_btn and query.strip():
             area_min=float(area_r[0]),
             query_raw=query,
         )
-        _log(f"[APP] Resultados brutos — ZAP: {len(zap_r)}  Viva: {len(viva_r)}  QA: {len(qa_r_raw)}")
+        _log(f"[APP] Resultados brutos — ZAP: {len(zap_r)}  Viva: {len(viva_r)}")
         _log(f"{'='*60}\n")
 
     st.session_state.zap_items  = zap_r
     st.session_state.viva_items = viva_r
-    st.session_state.qa_items   = qa_r_raw
     st.session_state.api_status = {
-        "ZAP Imóveis":  len(zap_r) > 0,
-        "Viva Real":    len(viva_r) > 0,
-        "Quinto Andar": len(qa_r_raw) > 0,
+        "ZAP Imóveis": len(zap_r) > 0,
+        "Viva Real":   len(viva_r) > 0,
     }
 
-    total = sum(map(len, [zap_r, viva_r, qa_r_raw]))
+    total = sum(map(len, [zap_r, viva_r]))
     if total:
         st.toast(f"✅ {total} imóveis reais encontrados!", icon="🏠")
-        todos_items = zap_r + viva_r + qa_r_raw
+        todos_items = zap_r + viva_r
         with st.spinner("🖼️ Carregando fotos dos imóveis..."):
             _prefetch_thumbnails(todos_items, max_imgs=60)
         todos_geo = _atribuir_coords(todos_items, lat, lon)
         n = len(zap_r)
         st.session_state.zap_items  = todos_geo[:n]
-        st.session_state.viva_items = todos_geo[n:n + len(viva_r)]
-        st.session_state.qa_items   = todos_geo[n + len(viva_r):]
+        st.session_state.viva_items = todos_geo[n:]
     else:
         st.toast("APIs responderam 0 resultados — tente outra cidade.", icon="⚠️")
 
@@ -949,8 +938,8 @@ if not st.session_state.buscou:
       <div class="welcome-t">Busque imóveis reais agora</div>
       <div class="welcome-s">
         Digite uma cidade, bairro ou endereço acima.<br>
-        O Lastro vai buscar em tempo real no <b>ZAP Imóveis</b>, <b>Viva Real</b>
-        e <b>Quinto Andar</b>, e usar IA para avaliar se o preço está
+        O Lastro vai buscar em tempo real no <b>ZAP Imóveis</b> e <b>Viva Real</b>,
+        e usar IA para avaliar se o preço está
         <b style="color:#34d399">bom</b>,
         <b style="color:#fbbf24">justo</b> ou
         <b style="color:#f87171">caro</b>.
@@ -1028,8 +1017,7 @@ def _filtrar_poi(items: list[dict]) -> list[dict]:
 
 zap_f      = _prever(_filtrar_poi(_filtrar(st.session_state.zap_items)))
 viva_f     = _prever(_filtrar_poi(_filtrar(st.session_state.viva_items)))
-qa_f       = _prever(_filtrar_poi(_filtrar(st.session_state.qa_items)))
-all_items  = zap_f + viva_f + qa_f
+all_items  = zap_f + viva_f
 total_res  = len(all_items)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1094,16 +1082,6 @@ with tab1:
             </div>""", unsafe_allow_html=True)
             _render_grid(viva_f[:60])
 
-        if qa_f:
-            if zap_f or viva_f:
-                st.divider()
-            st.markdown(f"""
-            <div class="sec-hdr">
-              <span class="sec-hdr-t">Quinto Andar</span>
-              <span class="sec-hdr-c">{len(qa_f)} anúncios</span>
-              <span class="sec-badge src-qa-badge">quintoandar.com.br</span>
-            </div>""", unsafe_allow_html=True)
-            _render_grid(qa_f[:60])
 
 with tab2:
     mapa_items = [i for i in all_items if i.get("latitude") and i.get("longitude")]
