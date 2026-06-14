@@ -20,6 +20,8 @@ from src.external.zapimoveis import (
     buscar,
     buscar_zap,
     buscar_vivareal,
+    detectar_zona_nome,
+    zona_por_coords,
 )
 
 
@@ -78,6 +80,29 @@ def _make_multi_item_html(n: int, preco: str = "450000", quartos: str = "2", are
     return f'<html><script type="application/ld+json">{json.dumps(ld)}</script></html>'
 
 
+def _make_bairro_item_html(n: int, bairro_slug: str = "jardim-maia") -> str:
+    """HTML com itens cujas URLs contêm o slug do bairro (simula acerto de bairro)."""
+    items = []
+    for i in range(n):
+        items.append({
+            "item": {
+                "@type": "Apartment",
+                "@id": f"id_{i}",
+                "name": f"Apto {i}",
+                "description": "",
+                "url": f"https://zapimoveis.com.br/venda/apto-2q-{bairro_slug}-guarulhos-sp-70m2-id-{i}/",
+                "offers": {"price": "350000"},
+                "address": {"addressLocality": "Guarulhos", "addressRegion": "sp", "streetAddress": ""},
+                "floorSize": {"value": "70"},
+                "numberOfBedrooms": "2",
+                "numberOfBathroomsTotal": "1",
+                "image": [],
+            }
+        })
+    ld = {"@type": "ItemList", "itemListElement": items}
+    return f'<html><script type="application/ld+json">{json.dumps(ld)}</script></html>'
+
+
 # ─── _slug ────────────────────────────────────────────────────────────────────
 
 class TestSlug:
@@ -128,8 +153,6 @@ class TestParseIntFromName:
 # ─── _bairro_from_url ────────────────────────────────────────────────────────
 
 class TestBairroFromUrl:
-    """Testa extração de bairro a partir da URL do anúncio ZAP/Viva Real."""
-
     def test_vila_nova_conceicao_zona_sul(self):
         url = "https://www.zapimoveis.com.br/imovel/venda-apartamento-1-quarto-mobiliado-vila-nova-conceicao-zona-sul-sao-paulo-sp-78m2-id-2763319033/"
         assert _bairro_from_url(url, "São Paulo") == "Vila Nova Conceicao"
@@ -143,7 +166,6 @@ class TestBairroFromUrl:
         assert _bairro_from_url(url, "São Paulo") == "Tatuape"
 
     def test_bairro_without_zona(self):
-        # Cidades menores sem zona-direção
         url = "https://www.zapimoveis.com.br/imovel/venda-casa-3-quartos-jardim-maia-guarulhos-sp-90m2-id-456/"
         assert _bairro_from_url(url, "Guarulhos") == "Jardim Maia"
 
@@ -154,7 +176,6 @@ class TestBairroFromUrl:
         assert _bairro_from_url("", "São Paulo") == ""
 
     def test_returns_empty_without_anchor(self):
-        # URL sem zona nem cidade conhecida e sem cidade_slug
         url = "https://www.zapimoveis.com.br/imovel/venda-apartamento-id-999/"
         assert _bairro_from_url(url) == ""
 
@@ -172,14 +193,10 @@ class TestBairroFromUrl:
         assert result == result.title()
 
     def test_url_takes_precedence_over_wrong_title_bairro(self):
-        """URL deve sobrescrever bairro errado do título (caso Vila Madalena vs Sumarezinho)."""
         url = "https://www.zapimoveis.com.br/imovel/venda-apartamento-3-quartos-com-churrasqueira-vila-madalena-zona-oeste-sao-paulo-sp-136m2-id-2888782275/"
-        # Título diz "Sumarezinho" mas URL diz "vila-madalena"
         titulo = "Apartamento em Sumarezinho, São Paulo"
-        from src.external.zapimoveis import _bairro_from_name
         bairro_titulo = _bairro_from_name(titulo, "São Paulo")
         bairro_url = _bairro_from_url(url, "São Paulo")
-        # A URL deve ganhar
         resultado_final = bairro_url or bairro_titulo
         assert resultado_final == "Vila Madalena"
 
@@ -448,6 +465,110 @@ class TestNormalizarLd:
         assert result["suites"] == 0
 
 
+# ─── detectar_zona_nome ───────────────────────────────────────────────────────
+
+class TestDetectarZonaNome:
+    def test_zona_oeste_retorna_slug_correto(self):
+        result = detectar_zona_nome("Zona Oeste")
+        assert result is not None
+        assert result[0] == "zona-oeste"
+
+    def test_zona_norte_retorna_slug_correto(self):
+        result = detectar_zona_nome("Zona Norte")
+        assert result is not None
+        assert result[0] == "zona-norte"
+
+    def test_zona_sul_retorna_slug_correto(self):
+        result = detectar_zona_nome("Zona Sul")
+        assert result is not None
+        assert result[0] == "zona-sul"
+
+    def test_zona_leste_retorna_slug_correto(self):
+        result = detectar_zona_nome("Zona Leste")
+        assert result is not None
+        assert result[0] == "zona-leste"
+
+    def test_zona_em_frase_completa(self):
+        result = detectar_zona_nome("apartamento 2 quartos Zona Norte São Paulo")
+        assert result is not None
+        assert result[0] == "zona-norte"
+
+    def test_case_insensitive(self):
+        result = detectar_zona_nome("ZONA OESTE")
+        assert result is not None
+
+    def test_com_acento(self):
+        # Zona já não tem acento mas texto ao redor pode ter
+        result = detectar_zona_nome("Imóvel na Zona Sul")
+        assert result is not None
+        assert result[0] == "zona-sul"
+
+    def test_retorna_none_para_bairro_comum(self):
+        assert detectar_zona_nome("Butantã") is None
+
+    def test_retorna_none_para_string_vazia(self):
+        assert detectar_zona_nome("") is None
+
+    def test_retorna_none_para_cidade_sem_zona(self):
+        assert detectar_zona_nome("Guarulhos") is None
+
+    def test_retorna_tupla_com_lat_lon(self):
+        result = detectar_zona_nome("Zona Oeste")
+        assert result is not None
+        slug, lat, lon = result
+        assert isinstance(lat, float)
+        assert isinstance(lon, float)
+
+    def test_coordenadas_sao_paulo_zona_oeste(self):
+        result = detectar_zona_nome("Zona Oeste")
+        assert result is not None
+        _, lat, lon = result
+        # Zona Oeste SP está a oeste do centro (-46.63)
+        assert lon < -46.65
+
+    def test_zona_sudoeste_mapeia_para_zona_oeste(self):
+        result = detectar_zona_nome("Zona Sudoeste")
+        assert result is not None
+        assert result[0] == "zona-oeste"
+
+    def test_centro_detectado(self):
+        result = detectar_zona_nome("centro de São Paulo")
+        assert result is not None
+
+
+# ─── zona_por_coords ──────────────────────────────────────────────────────────
+
+class TestZonaPorCoords:
+    def test_butanta_retorna_zona_oeste(self):
+        # Butantã: lat=-23.5694, lon=-46.7278 (extremo oeste)
+        result = zona_por_coords(-23.5694, -46.7278)
+        assert result == "zona-oeste"
+
+    def test_santana_retorna_zona_norte(self):
+        # Santana: lat=-23.4940, lon=-46.6319 (norte de SP)
+        result = zona_por_coords(-23.4940, -46.6319)
+        assert result == "zona-norte"
+
+    def test_itaquera_retorna_zona_leste(self):
+        # Itaquera: lat=-23.5394, lon=-46.4566 (extremo leste)
+        result = zona_por_coords(-23.5394, -46.4566)
+        assert result == "zona-leste"
+
+    def test_santo_amaro_retorna_zona_sul(self):
+        # Santo Amaro: lat=-23.6540, lon=-46.7000 (sul de SP)
+        result = zona_por_coords(-23.6540, -46.7000)
+        assert result == "zona-sul"
+
+    def test_retorna_string_valida(self):
+        result = zona_por_coords(-23.55, -46.63)
+        assert isinstance(result, str)
+        assert result in {"zona-norte", "zona-sul", "zona-leste", "zona-oeste"}
+
+    def test_resultado_consistente(self):
+        # Mesmas coords sempre retornam a mesma zona
+        assert zona_por_coords(-23.5694, -46.7278) == zona_por_coords(-23.5694, -46.7278)
+
+
 # ─── URL builders ─────────────────────────────────────────────────────────────
 
 class TestUrlZap:
@@ -499,6 +620,33 @@ class TestUrlZap:
         url = _url_zap("Belo Horizonte", "Minas Gerais")
         assert "/mg+" in url
 
+    # ── Novos: zona_slug ──────────────────────────────────────────────────────
+
+    def test_zona_slug_usa_formato_com_mais(self):
+        url = _url_zap("São Paulo", "São Paulo", zona_slug="zona-oeste")
+        assert "sao-paulo+zona-oeste" in url
+
+    def test_zona_slug_nao_usa_barra_de_bairro(self):
+        url = _url_zap("São Paulo", "São Paulo", zona_slug="zona-norte")
+        # Formato zona: .../sp+sao-paulo+zona-norte/  (sem barra bairro)
+        assert "/sp+sao-paulo+zona-norte/" in url
+
+    def test_zona_slug_prevalece_sobre_bairro(self):
+        url = _url_zap("São Paulo", "São Paulo", bairro="Pinheiros", zona_slug="zona-oeste")
+        assert "zona-oeste" in url
+        assert "pinheiros" not in url
+
+    def test_bairro_sem_zona_slug_usa_formato_bairro(self):
+        url = _url_zap("São Paulo", "São Paulo", bairro="Pinheiros")
+        assert "/pinheiros/" in url
+        assert "zona" not in url
+
+    def test_sem_bairro_sem_zona_usa_url_cidade(self):
+        url = _url_zap("São Paulo", "São Paulo")
+        # Formato cidade: .../sp+sao-paulo/apartamentos/
+        assert "+" in url
+        assert "/pinheiros/" not in url
+
 
 class TestUrlViva:
     def test_default_url_contains_vivareal(self):
@@ -533,6 +681,21 @@ class TestUrlViva:
         url = _url_viva("Guarulhos", "São Paulo", negocio="RENTAL")
         assert "aluguel" in url
 
+    # ── Novos: zona_slug ──────────────────────────────────────────────────────
+
+    def test_zona_slug_incluso_na_url(self):
+        url = _url_viva("São Paulo", "São Paulo", zona_slug="zona-norte")
+        assert "zona-norte" in url
+
+    def test_zona_slug_prevalece_sobre_bairro(self):
+        url = _url_viva("São Paulo", "São Paulo", bairro="Santana", zona_slug="zona-norte")
+        assert "zona-norte" in url
+        assert "santana" not in url
+
+    def test_bairro_sem_zona_mantém_formato_bairro(self):
+        url = _url_viva("São Paulo", "São Paulo", bairro="Santana")
+        assert "santana" in url
+
 
 # ─── buscar ───────────────────────────────────────────────────────────────────
 
@@ -565,7 +728,6 @@ class TestBuscar:
         assert results == []
 
     def test_quartos_zero_not_filtered(self):
-        # quartos=0 (unknown) should NOT be filtered even if quartos_min > 0
         html = _make_multi_item_html(2, quartos="0")
         with patch("src.external.zapimoveis._fetch_html", return_value=html), \
              patch("src.external.zapimoveis.time.sleep"):
@@ -594,7 +756,6 @@ class TestBuscar:
         assert results == []
 
     def test_preco_zero_not_filtered_by_preco_max(self):
-        # preco=0 (unknown) should NOT be filtered by preco_max
         html = _make_multi_item_html(2, preco="0")
         with patch("src.external.zapimoveis._fetch_html", return_value=html), \
              patch("src.external.zapimoveis.time.sleep"):
@@ -621,7 +782,6 @@ class TestBuscar:
         with patch("src.external.zapimoveis._fetch_html", return_value=None) as mock_fetch, \
              patch("src.external.zapimoveis.time.sleep"):
             buscar("Guarulhos", "São Paulo")
-        # Should fetch for both apartment and house (2 URL calls)
         assert mock_fetch.call_count == 2
 
     def test_sleep_called_between_tipos(self):
@@ -648,5 +808,151 @@ class TestBuscar:
         with patch("src.external.zapimoveis._fetch_html", return_value=html) as mock_fetch, \
              patch("src.external.zapimoveis.time.sleep"):
             results = buscar("Guarulhos", "São Paulo", limit=5, tipos=["apartment", "house"])
-        # Should stop before fetching house type since apartment alone fills limit
         assert mock_fetch.call_count == 1
+
+    def test_extra_kwargs_ignored(self):
+        """buscar() aceita e ignora kwargs desconhecidos (**_kw)."""
+        html = _make_multi_item_html(2)
+        with patch("src.external.zapimoveis._fetch_html", return_value=html), \
+             patch("src.external.zapimoveis.time.sleep"):
+            results = buscar(
+                "Guarulhos", "São Paulo",
+                tipos=["apartment"], limit=5,
+                unknown_param="test",
+                zona_slug="",
+                lat_busca=None,
+                lon_busca=None,
+            )
+        assert isinstance(results, list)
+
+    # ── Novos: fallback bairro → zona → cidade ────────────────────────────────
+
+    def test_zone_fallback_triggered_when_bairro_sem_match(self):
+        """Itens sem slug do bairro na URL → tenta zona antes de cidade."""
+        mismatched_html = _make_multi_item_html(3)   # URLs genéricas, sem "butanta"
+        zone_html = _make_multi_item_html(5)
+
+        fetch_calls = []
+        def fake_fetch(url):
+            fetch_calls.append(url)
+            if "zona-" in url:
+                return zone_html
+            return mismatched_html
+
+        with patch("src.external.zapimoveis._fetch_html", side_effect=fake_fetch), \
+             patch("src.external.zapimoveis.time.sleep"):
+            results = buscar(
+                "São Paulo", "São Paulo", bairro="Butantã",
+                tipos=["apartment"], limit=10,
+                lat_busca=-23.5694, lon_busca=-46.7278,
+            )
+
+        assert any("zona-" in url for url in fetch_calls), "URL de zona deve ser tentada"
+        assert len(results) == 5
+
+    def test_zone_fallback_nao_vai_para_cidade_quando_zona_retorna_dados(self):
+        """Quando zona retorna resultados, URL de cidade NÃO é chamada."""
+        mismatched_html = _make_multi_item_html(2)
+        zone_html = _make_multi_item_html(4)
+
+        fetch_calls = []
+        def fake_fetch(url):
+            fetch_calls.append(url)
+            if "zona-" in url:
+                return zone_html
+            return mismatched_html
+
+        with patch("src.external.zapimoveis._fetch_html", side_effect=fake_fetch), \
+             patch("src.external.zapimoveis.time.sleep"):
+            buscar(
+                "São Paulo", "São Paulo", bairro="Butantã",
+                tipos=["apartment"], limit=10,
+                lat_busca=-23.5694, lon_busca=-46.7278,
+            )
+
+        # Não deve ter tentado URL de cidade (sem bairro e sem zona no path)
+        cidade_urls = [u for u in fetch_calls if "zona-" not in u and "/butanta/" not in u
+                       and "sao-paulo/" in u and "apartamentos" in u]
+        assert len(cidade_urls) == 0
+
+    def test_city_fallback_quando_bairro_e_zona_falham(self):
+        """Quando bairro E zona não retornam dados, cai na URL de cidade."""
+        empty_html = "<html></html>"
+        city_html = _make_multi_item_html(4)
+
+        def fake_fetch(url):
+            if "zona-" in url or "/butanta/" in url:
+                return empty_html
+            return city_html  # URL de cidade retorna dados
+
+        with patch("src.external.zapimoveis._fetch_html", side_effect=fake_fetch), \
+             patch("src.external.zapimoveis.time.sleep"):
+            results = buscar(
+                "São Paulo", "São Paulo", bairro="Butantã",
+                tipos=["apartment"], limit=10,
+                lat_busca=-23.5694, lon_busca=-46.7278,
+            )
+
+        assert len(results) == 4
+
+    def test_sem_zona_fallback_para_cidade_nao_sp(self):
+        """Para cidades que não são SP, não tenta zona — vai direto para cidade."""
+        mismatched_html = _make_multi_item_html(2)
+        city_html = _make_multi_item_html(3)
+
+        fetch_calls = []
+        def fake_fetch(url):
+            fetch_calls.append(url)
+            if "zona-" in url:
+                return city_html  # Não deveria ser chamado
+            return mismatched_html
+
+        with patch("src.external.zapimoveis._fetch_html", side_effect=fake_fetch), \
+             patch("src.external.zapimoveis.time.sleep"):
+            buscar(
+                "Curitiba", "Paraná", bairro="Centro",
+                tipos=["apartment"], limit=5,
+                lat_busca=-25.4297, lon_busca=-49.2713,
+            )
+
+        assert not any("zona-" in url for url in fetch_calls)
+
+    def test_zona_slug_direto_usa_url_de_zona_sem_bairro(self):
+        """Quando zona_slug é fornecido diretamente, usa URL de zona desde o início."""
+        zone_html = _make_multi_item_html(4)
+        fetch_calls = []
+
+        def fake_fetch(url):
+            fetch_calls.append(url)
+            return zone_html
+
+        with patch("src.external.zapimoveis._fetch_html", side_effect=fake_fetch), \
+             patch("src.external.zapimoveis.time.sleep"):
+            results = buscar(
+                "São Paulo", "São Paulo",
+                zona_slug="zona-oeste",
+                tipos=["apartment"], limit=10,
+            )
+
+        assert any("zona-oeste" in url for url in fetch_calls)
+        assert len(results) == 4
+
+    def test_bairro_com_slug_na_url_nao_aciona_fallback(self):
+        """Quando os itens retornados têm o slug do bairro na URL, não há fallback."""
+        html_com_bairro = _make_bairro_item_html(3, bairro_slug="jardim-maia")
+        fetch_calls = []
+
+        def fake_fetch(url):
+            fetch_calls.append(url)
+            return html_com_bairro
+
+        with patch("src.external.zapimoveis._fetch_html", side_effect=fake_fetch), \
+             patch("src.external.zapimoveis.time.sleep"):
+            results = buscar(
+                "Guarulhos", "São Paulo", bairro="Jardim Maia",
+                tipos=["apartment"], limit=10,
+            )
+
+        # Só deve ter chamado a URL do bairro, sem fallback
+        assert len(fetch_calls) == 1
+        assert len(results) == 3
