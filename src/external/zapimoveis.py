@@ -12,10 +12,15 @@ Fontes:
 from __future__ import annotations
 
 import re
+import sys
 import time
 import unicodedata
 
 import requests
+
+
+def _log(*args, **kwargs):
+    print(*args, **kwargs, file=sys.stderr, flush=True)
 
 _TIMEOUT = 20
 _UA = (
@@ -54,8 +59,49 @@ _TIPO_VIVA: dict[str, str] = {
 _NEGOCIO_ZAP:  dict[str, str] = {"SALE": "venda",   "RENTAL": "aluguel"}
 _NEGOCIO_VIVA: dict[str, str] = {"SALE": "venda",   "RENTAL": "aluguel"}
 
+# Zonas de São Paulo — (slug_portal, lat_centro, lon_centro)
+_ZONAS_SP: dict[str, tuple[str, float, float]] = {
+    "zona norte":    ("zona-norte",  -23.4876, -46.6350),
+    "zona sul":      ("zona-sul",    -23.6557, -46.6654),
+    "zona leste":    ("zona-leste",  -23.5462, -46.4801),
+    "zona oeste":    ("zona-oeste",  -23.5674, -46.7297),
+    "zona central":  ("se",          -23.5489, -46.6388),
+    "zona centro":   ("se",          -23.5489, -46.6388),
+    "centro":        ("se",          -23.5489, -46.6388),
+    "zona nordeste": ("zona-norte",  -23.4876, -46.6350),
+    "zona sudeste":  ("zona-sul",    -23.6557, -46.6654),
+    "zona sudoeste": ("zona-oeste",  -23.5674, -46.7297),
+    "zona noroeste": ("zona-norte",  -23.4876, -46.6350),
+}
+
+_ZONA_CENTROS: dict[str, tuple[float, float]] = {
+    "zona-norte":  (-23.4876, -46.6350),
+    "zona-sul":    (-23.6557, -46.6654),
+    "zona-leste":  (-23.5462, -46.4801),
+    "zona-oeste":  (-23.5674, -46.7297),
+}
+
 
 # ─── helpers ──────────────────────────────────────────────────────────────
+
+def detectar_zona_nome(texto: str) -> tuple[str, float, float] | None:
+    """Detecta zona de SP pelo nome. Retorna (slug_zona, lat, lon) ou None."""
+    import unicodedata as _ud
+    nfkd = _ud.normalize("NFKD", texto)
+    norm = "".join(c for c in nfkd if not _ud.combining(c)).lower().replace("-", " ")
+    for nome, info in _ZONAS_SP.items():
+        if nome in norm:
+            return info
+    return None
+
+
+def zona_por_coords(lat: float, lon: float) -> str:
+    """Retorna o slug da zona de SP mais próxima das coordenadas."""
+    return min(
+        _ZONA_CENTROS,
+        key=lambda z: (lat - _ZONA_CENTROS[z][0]) ** 2 + (lon - _ZONA_CENTROS[z][1]) ** 2,
+    )
+
 
 def _slug(text: str) -> str:
     """Remove acentos e converte para slug (letras/números/hífens)."""
@@ -287,12 +333,21 @@ def _url_zap(
     negocio: str = "SALE",
     pagina: int = 1,
     bairro: str = "",
+    zona_slug: str = "",
 ) -> str:
-    uf         = _UF.get(estado, "sp")
-    tipo_slug  = _TIPO_ZAP.get(tipo, "imoveis")
-    neg_slug   = _NEGOCIO_ZAP.get(negocio, "venda")
+    uf          = _UF.get(estado, "sp")
+    tipo_slug   = _TIPO_ZAP.get(tipo, "imoveis")
+    neg_slug    = _NEGOCIO_ZAP.get(negocio, "venda")
     cidade_slug = _slug(cidade)
-    base = f"https://www.zapimoveis.com.br/{neg_slug}/{tipo_slug}/{uf}+{cidade_slug}/"
+    if zona_slug:
+        # Zona: sp+sao-paulo+zona-oeste  (ZAP usa + como separador)
+        base = (f"https://www.zapimoveis.com.br/{neg_slug}/{tipo_slug}/"
+                f"{uf}+{cidade_slug}+{zona_slug}/")
+    elif bairro:
+        base = (f"https://www.zapimoveis.com.br/{neg_slug}/{tipo_slug}/"
+                f"{uf}+{cidade_slug}/{_slug(bairro)}/")
+    else:
+        base = f"https://www.zapimoveis.com.br/{neg_slug}/{tipo_slug}/{uf}+{cidade_slug}/"
     if pagina > 1:
         base += f"?pagina={pagina}"
     return base
@@ -305,12 +360,19 @@ def _url_viva(
     negocio: str = "SALE",
     pagina: int = 1,
     bairro: str = "",
+    zona_slug: str = "",
 ) -> str:
-    uf         = _UF.get(estado, "sp")
-    tipo_slug  = _TIPO_VIVA.get(tipo, "apartamento_residencial")
-    neg_slug   = _NEGOCIO_VIVA.get(negocio, "venda")
+    uf          = _UF.get(estado, "sp")
+    tipo_slug   = _TIPO_VIVA.get(tipo, "apartamento_residencial")
+    neg_slug    = _NEGOCIO_VIVA.get(negocio, "venda")
     cidade_slug = _slug(cidade)
-    base = f"https://www.vivareal.com.br/{neg_slug}/{uf}/{cidade_slug}/{tipo_slug}/"
+    # Zona e bairro usam a mesma posição na URL do Viva Real
+    seg = zona_slug if zona_slug else (_slug(bairro) if bairro else "")
+    if seg:
+        base = (f"https://www.vivareal.com.br/{neg_slug}/{uf}/"
+                f"{cidade_slug}/{seg}/{tipo_slug}/")
+    else:
+        base = f"https://www.vivareal.com.br/{neg_slug}/{uf}/{cidade_slug}/{tipo_slug}/"
     if pagina > 1:
         base += f"?pagina={pagina}"
     return base
@@ -331,6 +393,10 @@ def buscar(
     preco_min: float = 0,
     preco_max: float = 0,
     area_min: float = 0,
+    zona_slug: str = "",
+    lat_busca: float | None = None,
+    lon_busca: float | None = None,
+    **_kw,
 ) -> list[dict]:
     """Busca imóveis via JSON-LD do ZAP Imóveis ou Viva Real (busca por cidade)."""
     tipos_use = tipos or ["apartment", "house"]
@@ -340,13 +406,66 @@ def buscar(
     for tipo in tipos_use:
         if len(results) >= limit:
             break
-        url = url_fn(cidade=cidade, estado=estado, tipo=tipo, negocio=negocio, pagina=pagina)
+        url = url_fn(cidade=cidade, estado=estado, tipo=tipo, negocio=negocio,
+                     pagina=pagina, bairro=bairro, zona_slug=zona_slug)
+        _log(f"[ZAP/{portal.upper()}] Buscando URL: {url}")
         html = _fetch_html(url)
-        if not html:
+        _log(f"[ZAP/{portal.upper()}] HTML recebido: {'sim' if html else 'NÃO (bloqueado ou erro)'} ({len(html) if html else 0} bytes)")
+        entries = _extrair_items_ld(html) if html else []
+        _log(f"[ZAP/{portal.upper()}] Entradas JSON-LD extraídas: {len(entries)}")
+
+        if bairro:
+            bairro_slug = _slug(bairro)
+            entradas_do_bairro = [
+                e for e in entries[:6]
+                if bairro_slug in ((e.get("item") or e).get("url") or "").lower()
+            ]
+            _log(f"[ZAP/{portal.upper()}] Entradas com slug '{bairro_slug}': {len(entradas_do_bairro)}/{min(6,len(entries))}")
+            if entries:
+                sample_urls = [((e.get("item") or e).get("url") or "")[:80] for e in entries[:3]]
+                _log(f"[ZAP/{portal.upper()}] URLs amostra: {sample_urls}")
+
+            if not entradas_do_bairro:
+                # Fallback 1: zona (mais preciso que cidade completa)
+                # Infere a zona pelas coordenadas do bairro quando não fornecida
+                zona_fb = zona_slug
+                if not zona_fb and lat_busca is not None and lon_busca is not None:
+                    if "sao paulo" in _slug(cidade).replace("-", " "):
+                        zona_fb = zona_por_coords(lat_busca, lon_busca)
+                        _log(f"[ZAP/{portal.upper()}] Zona inferida por coords: {zona_fb}")
+
+                usou_zona = False
+                if zona_fb:
+                    url_z = url_fn(cidade=cidade, estado=estado, tipo=tipo,
+                                   negocio=negocio, pagina=pagina, zona_slug=zona_fb)
+                    if url_z != url:
+                        _log(f"[ZAP/{portal.upper()}] Fallback zona: {url_z}")
+                        time.sleep(0.3)
+                        html_z = _fetch_html(url_z)
+                        _log(f"[ZAP/{portal.upper()}] HTML zona: {'sim' if html_z else 'NÃO'} ({len(html_z) if html_z else 0} bytes)")
+                        entries_z = _extrair_items_ld(html_z) if html_z else []
+                        _log(f"[ZAP/{portal.upper()}] Entradas zona: {len(entries_z)}")
+                        if entries_z:
+                            entries = entries_z
+                            usou_zona = True
+
+                if not usou_zona:
+                    # Fallback 2: cidade completa
+                    url_cidade = url_fn(cidade=cidade, estado=estado, tipo=tipo,
+                                        negocio=negocio, pagina=pagina)
+                    _log(f"[ZAP/{portal.upper()}] Fallback cidade: {url_cidade}")
+                    if url_cidade != url:
+                        time.sleep(0.3)
+                        html2 = _fetch_html(url_cidade)
+                        _log(f"[ZAP/{portal.upper()}] HTML cidade: {'sim' if html2 else 'NÃO'} ({len(html2) if html2 else 0} bytes)")
+                        entries = _extrair_items_ld(html2) if html2 else entries
+                        _log(f"[ZAP/{portal.upper()}] Entradas cidade: {len(entries)}")
+
+        if not entries:
+            _log(f"[ZAP/{portal.upper()}] Nenhuma entrada encontrada para tipo={tipo!r}, pulando.")
             time.sleep(0.5)
             continue
 
-        entries = _extrair_items_ld(html)
         for entry in entries:
             n = _normalizar_ld(entry, portal)
             if not n:

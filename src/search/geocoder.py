@@ -4,9 +4,14 @@ Rate limit: 1 req/s conforme politica do Nominatim.
 """
 from __future__ import annotations
 
+import sys
 import time
 
 import requests
+
+
+def _log(*args, **kwargs):
+    print(*args, **kwargs, file=sys.stderr, flush=True)
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "LastroProject/1.0 (imoveis-br-demo)"
@@ -69,14 +74,18 @@ def geocode_detalhado(texto: str) -> dict:
     }
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "pt-BR,pt"}
 
+    _log(f"[GEOCODER] Requisição Nominatim: q={params['q']!r}")
     try:
         r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=8)
         _last_call = time.time()
+        _log(f"[GEOCODER] Status HTTP: {r.status_code}")
         data = r.json()
         if not data:
+            _log("[GEOCODER] Nominatim retornou lista vazia — nenhum resultado.")
             return {}
         hit = data[0]
         addr = hit.get("address", {})
+        _log(f"[GEOCODER] Endereço bruto retornado: {addr}")
         cidade = (
             addr.get("city") or
             addr.get("town") or
@@ -90,12 +99,15 @@ def geocode_detalhado(texto: str) -> dict:
             addr.get("neighbourhood") or
             addr.get("quarter") or ""
         )
-        return {
+        result = {
             "lat":    float(hit["lat"]),
             "lon":    float(hit["lon"]),
             "cidade": cidade,
             "estado": estado,
             "bairro": bairro,
         }
-    except Exception:
+        _log(f"[GEOCODER] Resultado: cidade={cidade!r} estado={estado!r} bairro={bairro!r} lat={result['lat']} lon={result['lon']}")
+        return result
+    except Exception as e:
+        _log(f"[GEOCODER] Exceção: {e}")
         return {}

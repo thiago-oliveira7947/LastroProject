@@ -8,8 +8,14 @@ import base64
 import hashlib
 import html as _html
 import math
+import sys
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _log(*args, **kwargs):
+    """Print para stderr com flush imediato — visível mesmo com stdout capturado pelo Streamlit."""
+    print(*args, **kwargs, file=sys.stderr, flush=True)
 
 import requests as _requests
 
@@ -23,7 +29,7 @@ from streamlit_folium import st_folium
 load_dotenv()
 
 from src import config
-from src.external import mercadolivre as ml_api
+from src.external import quintoandar as qa_api
 from src.external import zapimoveis
 from src.models.predict import carregar_metadata, carregar_modelo
 from src.search.engine import filtrar_por_poi, haversine_km
@@ -40,8 +46,7 @@ from src.search.query_parser import parse as parse_query
 _REFERER_MAP = {
     "zapimoveis":   "https://www.zapimoveis.com.br/",
     "vivareal":     "https://www.vivareal.com.br/",
-    "mercadolibre": "https://www.mercadolivre.com.br/",
-    "mlstatic":     "https://www.mercadolivre.com.br/",
+    "quintoandar":  "https://www.quintoandar.com.br/",
 }
 
 def _referer(url: str) -> str:
@@ -179,6 +184,26 @@ def _extrair_bairro(location_text: str, cidade: str) -> str:
     return t.strip().title() if t.strip() else ""
 
 
+def _bairro_match(item_bairro: str, target: str) -> bool:
+    """Retorna True se o bairro do item corresponde ao bairro alvo da busca.
+
+    Normaliza acentos e capitalização. Usa correspondência por palavras
+    (todas as palavras significativas do alvo devem aparecer no bairro do item),
+    o que tolera abreviações e sufixos como 'Jardim Maia' ↔ 'Jardim Maia Guarulhos'.
+    Itens sem bairro são sempre incluídos (não há dado para filtrar).
+    """
+    if not target:
+        return True
+    if not item_bairro:
+        return True  # sem dado de bairro → inclui (raio_km decide pela distância)
+    t = _slug(target)
+    b = _slug(item_bairro)
+    if t in b or b in t:
+        return True
+    words = [w for w in t.split() if len(w) > 2]
+    return bool(words) and all(w in b for w in words)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════════════
@@ -289,6 +314,7 @@ hr{border-color:rgba(255,255,255,.06)!important}
 .src-zap     {background:rgba(255,93,0,.18);color:#fb923c;border:1px solid rgba(251,146,60,.25)}
 .src-vivareal{background:rgba(124,58,237,.18);color:#a78bfa;border:1px solid rgba(167,139,250,.25)}
 .src-ml      {background:rgba(255,196,0,.18);color:#fbbf24;border:1px solid rgba(251,191,36,.25)}
+.src-qa      {background:rgba(0,191,165,.18);color:#2dd4bf;border:1px solid rgba(45,212,191,.25)}
 
 .price-pill{position:absolute;bottom:12px;right:12px;
   background:rgba(0,0,0,.78);backdrop-filter:blur(12px);
@@ -345,6 +371,7 @@ hr{border-color:rgba(255,255,255,.06)!important}
 .src-zap-badge     {background:rgba(255,93,0,.15);color:#fb923c}
 .src-vivareal-badge{background:rgba(124,58,237,.15);color:#a78bfa}
 .src-ml-badge      {background:rgba(255,196,0,.15);color:#fbbf24}
+.src-qa-badge      {background:rgba(0,191,165,.15);color:#2dd4bf}
 
 /* ══ WELCOME / EMPTY ══ */
 .welcome{text-align:center;padding:80px 20px 60px}
@@ -434,7 +461,7 @@ def _eval(preco: float, previsto: float):
 _SRC_LABEL: dict[str, tuple[str, str]] = {
     "zap":          ("ZAP Imóveis",  "src-zap"),
     "vivareal":     ("Viva Real",    "src-vivareal"),
-    "mercadolivre": ("MercadoLivre", "src-ml"),
+    "quintoandar":  ("Quinto Andar", "src-qa"),
 }
 
 
@@ -673,14 +700,14 @@ def _atribuir_coords(
 # ══════════════════════════════════════════════════════════════════════════
 
 def _buscar_tudo(
-    cidade: str, estado: str, bairro: str,
+    cidade: str, estado: str,
     tipos: list[str], negocio: str,
     quartos_min: int, preco_min: float, preco_max: float, area_min: float,
     query_raw: str = "",
-    limit_por_fonte: int = 24,
+    limit_por_fonte: int = 60,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     kw = dict(
-        cidade=cidade, estado=estado, bairro=bairro,
+        cidade=cidade, estado=estado, bairro="",
         tipos=tipos if tipos else ["apartment", "house"],
         negocio=negocio,
         quartos_min=quartos_min,
@@ -692,24 +719,10 @@ def _buscar_tudo(
 
     def _zap():   return zapimoveis.buscar_zap(**kw)
     def _viva():  return zapimoveis.buscar_vivareal(**kw)
-    def _ml_pub():
-        tipo_pt = TIPOS_PT.get(tipos[0], "") if tipos else ""
-        neg_kw = "aluguel" if negocio == "RENTAL" else ""
-        q = " ".join(filter(None, [
-            neg_kw, tipo_pt, bairro or cidade,
-            f"{quartos_min} quartos" if quartos_min else "",
-        ]))
-        return ml_api.buscar_publico(q or cidade, limit=limit_por_fonte, negocio=negocio)
-    def _ml_auth():
-        if not ml_api.esta_autenticado():
-            return []
-        tipo_pt = TIPOS_PT.get(tipos[0], "") if tipos else ""
-        neg_kw = "aluguel" if negocio == "RENTAL" else ""
-        q = " ".join(filter(None, [neg_kw, tipo_pt, bairro or cidade]))
-        return ml_api.buscar(q or cidade, limit=limit_por_fonte)
+    def _qa():    return qa_api.buscar(**kw)
 
     results: dict[str, list[dict]] = {}
-    fns = {"zap": _zap, "viva": _viva, "ml_pub": _ml_pub, "ml_auth": _ml_auth}
+    fns = {"zap": _zap, "viva": _viva, "qa": _qa}
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(fn): key for key, fn in fns.items()}
@@ -723,8 +736,8 @@ def _buscar_tudo(
     return (
         results.get("zap", []),
         results.get("viva", []),
-        results.get("ml_pub", []),
-        results.get("ml_auth", []),
+        results.get("qa", []),
+        [],
     )
 
 
@@ -738,10 +751,10 @@ def _init():
         "poi_locs":       {},
         "qp":             None,
         "buscou":         False,
+        "bairro_busca":   "",
         "zap_items":      [],
         "viva_items":     [],
-        "ml_pub_items":   [],
-        "ml_auth_items":  [],
+        "qa_items":       [],
         "api_status":     {},
         "aviso_bairro":   "",
     }
@@ -757,29 +770,6 @@ _init()
 with st.sidebar:
     st.markdown("## 🏠 Lastro Imóveis")
     st.caption("Dados reais · IA de precificação")
-
-    if ml_api.esta_autenticado():
-        st.success("✅ Mercado Livre conectado", icon="🔗")
-    elif ml_api.get_credentials():
-        url = ml_api.auth_url()
-        st.markdown(
-            f'<a href="{url}" target="_blank" style="display:block;text-align:center;'
-            f'padding:8px;background:rgba(255,196,0,.12);border:1px solid rgba(255,196,0,.25);'
-            f'border-radius:10px;color:#fbbf24;text-decoration:none;font-size:13px;font-weight:600">'
-            f'🔗 Conectar Mercado Livre</a>',
-            unsafe_allow_html=True,
-        )
-        code = st.text_input("Código de autorização:", key="ml_code",
-                             label_visibility="collapsed",
-                             placeholder="Cole o código de autorização aqui...")
-        if code and st.button("Ativar", key="ml_activate"):
-            if ml_api.trocar_codigo(code.strip()):
-                st.success("Conectado!")
-                st.rerun()
-            else:
-                st.error("Código inválido")
-    else:
-        st.info("Adicione credenciais ML gratuitas no `.env` para acesso autenticado.", icon="ℹ️")
 
     st.divider()
     st.markdown("### Filtros")
@@ -803,7 +793,14 @@ with st.sidebar:
         preco_r = st.slider("Preço (R$)", 50_000, 5_000_000,
                             (50_000, 5_000_000), step=50_000, format="R$ %d")
     vagas_r     = st.slider("Vagas",       0, 6, (0, 4))
-    raio_km     = st.slider("Raio de busca (km)", 1, 50, 15, help="Filtra imóveis pela distância do centro da busca")
+    # Aplica intenção de raio (definida pelo handler de busca quando detecta bairro)
+    # antes do widget ser criado — única janela válida para alterar a chave do slider.
+    if "_raio_next" in st.session_state:
+        st.session_state["raio_km_slider"] = st.session_state["_raio_next"]
+        del st.session_state["_raio_next"]
+    raio_km     = st.slider("Raio de busca (km)", 1, 50, 15,
+                            key="raio_km_slider",
+                            help="Filtra imóveis pela distância do centro da busca. Bairros específicos: 3–5 km")
 
     st.divider()
     st.markdown("### 📍 Próximo a")
@@ -839,7 +836,7 @@ with st.sidebar:
 st.markdown("""
 <div class="hero">
   <div class="hero-title">Encontre seu imóvel ideal</div>
-  <div class="hero-sub">ZAP Imóveis · Viva Real · Mercado Livre · Previsão de preço por IA</div>
+  <div class="hero-sub">ZAP Imóveis · Viva Real · Quinto Andar · Previsão de preço por IA</div>
 </div>""", unsafe_allow_html=True)
 
 with st.form("busca_form", clear_on_submit=False, border=False):
@@ -859,7 +856,7 @@ with st.expander("💡 Como buscar", expanded=False):
 |---|---|
 | Tipo | `apartamento`, `casa`, `terreno`, `comercial` |
 | Quartos | `3 quartos`, `2 dormitórios`, `1 suíte` |
-| Localização | `Jardim Maia Guarulhos`, `Moema São Paulo`, `Savassi Belo Horizonte` |
+| Localização | `Guarulhos`, `São Paulo`, `Belo Horizonte`, `Curitiba` |
 | Proximidade | `perto de escola`, `próximo ao metrô`, `perto de mercado` |
 
 Altere **Venda / Aluguel** e demais filtros na barra lateral antes de buscar.
@@ -876,6 +873,8 @@ if buscar_btn and query.strip():
     loc_text = qp.location_text or query
 
     with st.spinner("Pesquisando imóveis..."):
+        _log(f"\n{'='*60}")
+        _log(f"[APP] Nova busca: query={query!r}  loc_text={loc_text!r}")
         geo = geocode_detalhado(loc_text)
 
         lat    = geo.get("lat", DEFAULT_LAT)
@@ -884,26 +883,28 @@ if buscar_btn and query.strip():
         estado = geo.get("estado") or ""
         bairro = geo.get("bairro") or ""
 
+        _log(f"[APP] Geocoding resultado: cidade={cidade!r} estado={estado!r} lat={lat} lon={lon}")
+
         if not cidade:
             cidade, estado = _extrair_cidade(loc_text)
-            bairro = _extrair_bairro(loc_text, cidade)
+            _log(f"[APP] Cidade extraída do texto: cidade={cidade!r} estado={estado!r}")
+
+        _log(f"[APP] Buscando por cidade={cidade!r} estado={estado!r}")
 
         st.session_state.geocoded       = (lat, lon)
-        st.session_state.geocoded_label = (
-            ", ".join(filter(None, [bairro, cidade])) or loc_text.title()
-        )
+        st.session_state.bairro_busca   = ""
+        st.session_state.geocoded_label = cidade or loc_text.title()
 
         tipos_eff = qp.tipo_hint or tipos_sel or list(TIPOS_PT.keys())
+        _log(f"[APP] tipos_eff={tipos_eff}  negocio={negocio_api!r}")
 
         pois_eff = list(set(pois_sidebar + (qp.poi_hints or [])))
         if pois_eff:
-            # Pré-aquece o cache para que _filtrar_poi não faça nova requisição
             _buscar_pois_cached(lat, lon, int(raio_km * 1000 + 3000), tuple(sorted(pois_eff)))
-        st.session_state.poi_locs = {}  # mantido por compatibilidade, mas não mais usado por _filtrar_poi
+        st.session_state.poi_locs = {}
 
-        zap_r, viva_r, ml_pub_r, ml_auth_r = _buscar_tudo(
+        zap_r, viva_r, qa_r_raw, _ = _buscar_tudo(
             cidade=cidade, estado=estado,
-            bairro=bairro,
             tipos=tipos_eff,
             negocio=negocio_api,
             quartos_min=qp.quartos_hint or quartos_r[0],
@@ -912,31 +913,29 @@ if buscar_btn and query.strip():
             area_min=float(area_r[0]),
             query_raw=query,
         )
+        _log(f"[APP] Resultados brutos — ZAP: {len(zap_r)}  Viva: {len(viva_r)}  QA: {len(qa_r_raw)}")
+        _log(f"{'='*60}\n")
 
-    st.session_state.zap_items     = zap_r
-    st.session_state.viva_items    = viva_r
-    st.session_state.ml_pub_items  = ml_pub_r
-    st.session_state.ml_auth_items = ml_auth_r
-    st.session_state.api_status    = {
-        "ZAP Imóveis":    len(zap_r) > 0,
-        "Viva Real":      len(viva_r) > 0,
-        "ML (público)":   len(ml_pub_r) > 0,
-        "ML (auth)":      len(ml_auth_r) > 0,
+    st.session_state.zap_items  = zap_r
+    st.session_state.viva_items = viva_r
+    st.session_state.qa_items   = qa_r_raw
+    st.session_state.api_status = {
+        "ZAP Imóveis":  len(zap_r) > 0,
+        "Viva Real":    len(viva_r) > 0,
+        "Quinto Andar": len(qa_r_raw) > 0,
     }
 
-    total = sum(map(len, [zap_r, viva_r, ml_pub_r, ml_auth_r]))
+    total = sum(map(len, [zap_r, viva_r, qa_r_raw]))
     if total:
         st.toast(f"✅ {total} imóveis reais encontrados!", icon="🏠")
-        todos_items = zap_r + viva_r + ml_pub_r + ml_auth_r
+        todos_items = zap_r + viva_r + qa_r_raw
         with st.spinner("🖼️ Carregando fotos dos imóveis..."):
             _prefetch_thumbnails(todos_items, max_imgs=60)
-        # Atribui coordenadas para exibição no mapa
         todos_geo = _atribuir_coords(todos_items, lat, lon)
         n = len(zap_r)
-        st.session_state.zap_items     = todos_geo[:n]
-        st.session_state.viva_items    = todos_geo[n:n + len(viva_r)]
-        st.session_state.ml_pub_items  = todos_geo[n + len(viva_r):n + len(viva_r) + len(ml_pub_r)]
-        st.session_state.ml_auth_items = todos_geo[n + len(viva_r) + len(ml_pub_r):]
+        st.session_state.zap_items  = todos_geo[:n]
+        st.session_state.viva_items = todos_geo[n:n + len(viva_r)]
+        st.session_state.qa_items   = todos_geo[n + len(viva_r):]
     else:
         st.toast("APIs responderam 0 resultados — tente outra cidade.", icon="⚠️")
 
@@ -951,7 +950,7 @@ if not st.session_state.buscou:
       <div class="welcome-s">
         Digite uma cidade, bairro ou endereço acima.<br>
         O Lastro vai buscar em tempo real no <b>ZAP Imóveis</b>, <b>Viva Real</b>
-        e <b>Mercado Livre</b>, e usar IA para avaliar se o preço está
+        e <b>Quinto Andar</b>, e usar IA para avaliar se o preço está
         <b style="color:#34d399">bom</b>,
         <b style="color:#fbbf24">justo</b> ou
         <b style="color:#f87171">caro</b>.
@@ -970,36 +969,43 @@ def _filtrar(items: list[dict]) -> list[dict]:
     q_min, q_max = quartos_r
     b_min, b_max = banheiros_r
     lat_c, lon_c = st.session_state.geocoded
-    check_raio = st.session_state.buscou
+    check_raio   = st.session_state.buscou
     out = []
+    n_tipo = n_quartos = n_banheiros = n_area = n_preco = n_vagas = n_negocio = n_raio = 0
     for i in items:
         if tipos_sel and i.get("tipo") not in tipos_sel:
-            continue
+            n_tipo += 1; continue
         if not (q_min <= int(i.get("quartos") or 0) <= q_max):
-            continue
+            n_quartos += 1; continue
         if not (b_min <= int(i.get("banheiros") or 0) <= b_max):
-            continue
+            n_banheiros += 1; continue
         a = float(i.get("area") or 0)
         if a > 0 and not (area_r[0] <= a <= area_r[1]):
-            continue
+            n_area += 1; continue
         p = float(i.get("preco") or 0)
         if p > 0 and not (preco_r[0] <= p <= preco_r[1]):
-            continue
+            n_preco += 1; continue
         v = int(i.get("vagas_garagem") or 0)
         if vagas_r[0] > 0 and not (vagas_r[0] <= v <= vagas_r[1]):
-            continue
+            n_vagas += 1; continue
         neg = i.get("negocio") or "SALE"
         if negocio_api == "SALE" and neg == "RENTAL":
-            continue
+            n_negocio += 1; continue
         if negocio_api == "RENTAL" and neg == "SALE":
-            continue
+            n_negocio += 1; continue
         if check_raio:
             item_lat = i.get("latitude")
             item_lon = i.get("longitude")
             if item_lat is not None and item_lon is not None:
                 if haversine_km(lat_c, lon_c, item_lat, item_lon) > raio_km:
-                    continue
+                    n_raio += 1; continue
         out.append(i)
+    if items:
+        _log(f"[FILTRAR] Entrada: {len(items)} → Saída: {len(out)} | "
+             f"tipo={n_tipo} quartos={n_quartos} banheiros={n_banheiros} "
+             f"area={n_area} preco={n_preco} vagas={n_vagas} "
+             f"negocio={n_negocio} raio={n_raio} "
+             f"(raio_km={raio_km}, check_raio={check_raio})")
     return out
 
 
@@ -1022,9 +1028,8 @@ def _filtrar_poi(items: list[dict]) -> list[dict]:
 
 zap_f      = _prever(_filtrar_poi(_filtrar(st.session_state.zap_items)))
 viva_f     = _prever(_filtrar_poi(_filtrar(st.session_state.viva_items)))
-ml_pub_f   = _prever(_filtrar_poi(_filtrar(st.session_state.ml_pub_items)))
-ml_auth_f  = _prever(_filtrar_poi(_filtrar(st.session_state.ml_auth_items)))
-all_items  = zap_f + viva_f + ml_auth_f + ml_pub_f
+qa_f       = _prever(_filtrar_poi(_filtrar(st.session_state.qa_items)))
+all_items  = zap_f + viva_f + qa_f
 total_res  = len(all_items)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1076,7 +1081,7 @@ with tab1:
               <span class="sec-hdr-c">{len(zap_f)} anúncios</span>
               <span class="sec-badge src-zap-badge">zapimoveis.com.br</span>
             </div>""", unsafe_allow_html=True)
-            _render_grid(zap_f[:30])
+            _render_grid(zap_f[:60])
 
         if viva_f:
             if zap_f:
@@ -1087,19 +1092,18 @@ with tab1:
               <span class="sec-hdr-c">{len(viva_f)} anúncios</span>
               <span class="sec-badge src-vivareal-badge">vivareal.com.br</span>
             </div>""", unsafe_allow_html=True)
-            _render_grid(viva_f[:30])
+            _render_grid(viva_f[:60])
 
-        ml_all = ml_auth_f + ml_pub_f
-        if ml_all:
+        if qa_f:
             if zap_f or viva_f:
                 st.divider()
             st.markdown(f"""
             <div class="sec-hdr">
-              <span class="sec-hdr-t">Mercado Livre</span>
-              <span class="sec-hdr-c">{len(ml_all)} anúncios</span>
-              <span class="sec-badge src-ml-badge">mercadolivre.com.br</span>
+              <span class="sec-hdr-t">Quinto Andar</span>
+              <span class="sec-hdr-c">{len(qa_f)} anúncios</span>
+              <span class="sec-badge src-qa-badge">quintoandar.com.br</span>
             </div>""", unsafe_allow_html=True)
-            _render_grid(ml_all[:30])
+            _render_grid(qa_f[:60])
 
 with tab2:
     mapa_items = [i for i in all_items if i.get("latitude") and i.get("longitude")]

@@ -224,6 +224,7 @@ def buscar_publico(query: str, limit: int = 24, negocio: str = "SALE") -> list[d
     q = query
     if negocio == "RENTAL" and "aluguel" not in q.lower():
         q = f"aluguel {q}"
+    print(f"[ML] Busca pública: q={q!r} negocio={negocio!r}")
     try:
         r = requests.get(
             _SEARCH,
@@ -232,11 +233,16 @@ def buscar_publico(query: str, limit: int = 24, negocio: str = "SALE") -> list[d
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"},
             timeout=12,
         )
+        print(f"[ML] Status HTTP: {r.status_code}")
         if r.status_code in (401, 403, 429):
+            print(f"[ML] Bloqueado pelo servidor ({r.status_code}).")
             return []
         r.raise_for_status()
-        return [_normalizar(item) for item in r.json().get("results", [])]
-    except Exception:
+        items = r.json().get("results", [])
+        print(f"[ML] Resultados recebidos: {len(items)}")
+        return [_normalizar(item) for item in items]
+    except Exception as e:
+        print(f"[ML] Exceção: {e}")
         return []
 
 
