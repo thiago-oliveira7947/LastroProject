@@ -584,7 +584,7 @@ def _criar_mapa(items: list[dict], lat_c: float, lon_c: float) -> folium.Map:
 # GEOCODIFICAÇÃO DE IMÓVEIS (atribui lat/lon para marcadores no mapa)
 # ══════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _geocode_bairro_cached(bairro: str, cidade: str, estado: str) -> tuple[float, float] | None:
     """Geocodifica bairro+cidade — resultado em cache por 24h."""
     from src.search.geocoder import geocode
@@ -598,16 +598,32 @@ def _atribuir_coords(
     items: list[dict],
     fallback_lat: float,
     fallback_lon: float,
-    max_novas_queries: int = 8,
+    max_novas_queries: int = 20,
 ) -> list[dict]:
     """Atribui latitude/longitude a itens sem coordenadas.
 
-    Geocodifica cada grupo único (bairro, cidade, estado) com jitter deterministico
-    para que pins não se sobreponham no mapa.
+    Prioridade de coordenadas:
+    1. Bairro + cidade  (geocodificado)
+    2. Cidade apenas    (quando bairro não disponível ou geocoding falhou)
+    3. Fallback genérico da busca  (último recurso)
+
+    Jitter determinístico ~±200 m evita sobreposição de pins.
     """
     geo_cache: dict[tuple, tuple[float, float]] = {}
     novas = 0
     result = []
+
+    def _geocode_key(key: tuple) -> tuple[float, float] | None:
+        nonlocal novas
+        if key in geo_cache:
+            return geo_cache[key]
+        if novas >= max_novas_queries:
+            return None
+        coords = _geocode_bairro_cached(*key)
+        novas += 1
+        if coords:
+            geo_cache[key] = coords
+        return coords
 
     for item in items:
         if item.get("latitude") and item.get("longitude"):
@@ -617,19 +633,19 @@ def _atribuir_coords(
         bairro = (item.get("bairro") or "").strip().title()
         cidade = (item.get("cidade") or "").strip().title()
         estado = (item.get("estado") or "").strip()
-        key = (bairro, cidade, estado)
 
-        if key not in geo_cache:
-            if novas < max_novas_queries:
-                coords = _geocode_bairro_cached(bairro, cidade, estado)
-                novas += 1
-            else:
-                coords = None
-            geo_cache[key] = coords or (fallback_lat, fallback_lon)
+        # Tenta bairro+cidade; se falhar, tenta só cidade; se falhar, usa fallback
+        coords = None
+        if bairro:
+            coords = _geocode_key((bairro, cidade, estado))
+        if not coords:
+            coords = _geocode_key(("", cidade, estado))
+        if not coords:
+            coords = (fallback_lat, fallback_lon)
 
-        lat_base, lon_base = geo_cache[key]
+        geo_cache[(bairro, cidade, estado)] = coords
 
-        # Jitter deterministico (~±200 m) por item para não empilhar pins
+        lat_base, lon_base = coords
         h = int(hashlib.md5((item.get("id") or item.get("titulo") or "").encode()).hexdigest()[:8], 16)
         lat_jit = ((h & 0xFFFF) - 32768) * 0.002 / 32768
         lon_jit = (((h >> 16) & 0xFFFF) - 32768) * 0.002 / 32768
@@ -643,28 +659,6 @@ def _atribuir_coords(
 # FILTRO PÓS-BUSCA POR BAIRRO
 # ══════════════════════════════════════════════════════════════════════════
 
-def _filtrar_bairro(items: list[dict], bairro_alvo: str) -> list[dict]:
-    """Descarta imóveis cujo bairro não corresponde ao bairro buscado.
-
-    Mantém item se:
-    - bairro do item contém ou está contido no bairro buscado (match parcial)
-    - item não tem bairro, mas o título menciona o bairro
-    Descarta: item tem bairro diferente do buscado.
-    Fallback: se o filtro zerar resultados, retorna lista original.
-    """
-    alvo = _slug(bairro_alvo)
-    if not alvo:
-        return items
-    mantidos: list[dict] = []
-    for it in items:
-        b = _slug(it.get("bairro") or "")
-        t = _slug(it.get("titulo") or "") + " " + _slug(it.get("descricao") or "")
-        if not b:
-            if alvo in t:
-                mantidos.append(it)
-        elif alvo in b or b in alvo:
-            mantidos.append(it)
-    return mantidos if mantidos else items
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -740,6 +734,7 @@ def _init():
         "ml_pub_items":   [],
         "ml_auth_items":  [],
         "api_status":     {},
+        "aviso_bairro":   "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -833,15 +828,16 @@ st.markdown("""
   <div class="hero-sub">ZAP Imóveis · Viva Real · Mercado Livre · Previsão de preço por IA</div>
 </div>""", unsafe_allow_html=True)
 
-col_q, col_btn = st.columns([5, 1])
-with col_q:
-    query = st.text_input(
-        "Buscar", label_visibility="collapsed",
-        placeholder="Ex: apartamento 3 quartos Jardim Maia Guarulhos perto de escola",
-        key="search_input",
-    )
-with col_btn:
-    buscar_btn = st.button("🔍 Buscar", type="primary", use_container_width=True)
+with st.form("busca_form", clear_on_submit=False, border=False):
+    col_q, col_btn = st.columns([5, 1])
+    with col_q:
+        query = st.text_input(
+            "Buscar", label_visibility="collapsed",
+            placeholder="Ex: apartamento 3 quartos Jardim Maia Guarulhos perto de escola",
+            key="search_input",
+        )
+    with col_btn:
+        buscar_btn = st.form_submit_button("🔍 Buscar", type="primary", use_container_width=True)
 
 with st.expander("💡 Como buscar", expanded=False):
     st.markdown("""
@@ -864,37 +860,35 @@ if buscar_btn and query.strip():
     st.session_state.buscou = True
 
     loc_text = qp.location_text or query
-    with st.spinner(f"📍 Localizando «{loc_text}»..."):
+
+    with st.spinner("Pesquisando imóveis..."):
         geo = geocode_detalhado(loc_text)
 
-    lat     = geo.get("lat", DEFAULT_LAT)
-    lon     = geo.get("lon", DEFAULT_LON)
-    cidade  = geo.get("cidade") or ""
-    estado  = geo.get("estado") or ""
-    bairro  = geo.get("bairro") or ""
+        lat    = geo.get("lat", DEFAULT_LAT)
+        lon    = geo.get("lon", DEFAULT_LON)
+        cidade = geo.get("cidade") or ""
+        estado = geo.get("estado") or ""
+        bairro = geo.get("bairro") or ""
 
-    # Fallback texto se geocoder não retornou cidade (raro)
-    if not cidade:
-        cidade, estado = _extrair_cidade(loc_text)
-        bairro = _extrair_bairro(loc_text, cidade)
+        if not cidade:
+            cidade, estado = _extrair_cidade(loc_text)
+            bairro = _extrair_bairro(loc_text, cidade)
 
-    st.session_state.geocoded       = (lat, lon)
-    st.session_state.geocoded_label = (
-        ", ".join(filter(None, [bairro, cidade])) or loc_text.title()
-    )
+        st.session_state.geocoded       = (lat, lon)
+        st.session_state.geocoded_label = (
+            ", ".join(filter(None, [bairro, cidade])) or loc_text.title()
+        )
 
-    tipos_eff = qp.tipo_hint or tipos_sel or list(TIPOS_PT.keys())
+        tipos_eff = qp.tipo_hint or tipos_sel or list(TIPOS_PT.keys())
 
-    pois_eff = list(set(pois_sidebar + (qp.poi_hints or [])))
-    if pois_eff:
-        with st.spinner(f"📍 Buscando POIs: {', '.join(pois_eff)}..."):
+        pois_eff = list(set(pois_sidebar + (qp.poi_hints or [])))
+        if pois_eff:
             st.session_state.poi_locs = buscar_pois_localizacoes(
                 lat, lon, raio_km * 1000 + 2000, pois_eff
             )
-    else:
-        st.session_state.poi_locs = {}
+        else:
+            st.session_state.poi_locs = {}
 
-    with st.spinner("🔎 Buscando imóveis em ZAP Imóveis, Viva Real e Mercado Livre..."):
         zap_r, viva_r, ml_pub_r, ml_auth_r = _buscar_tudo(
             cidade=cidade, estado=estado,
             bairro=bairro,
@@ -906,11 +900,6 @@ if buscar_btn and query.strip():
             area_min=float(area_r[0]),
             query_raw=query,
         )
-
-    # Filtra por bairro quando um bairro específico foi identificado
-    if bairro:
-        zap_r  = _filtrar_bairro(zap_r,  bairro)
-        viva_r = _filtrar_bairro(viva_r, bairro)
 
     st.session_state.zap_items     = zap_r
     st.session_state.viva_items    = viva_r
@@ -930,8 +919,7 @@ if buscar_btn and query.strip():
         with st.spinner("🖼️ Carregando fotos dos imóveis..."):
             _prefetch_thumbnails(todos_items, max_imgs=60)
         # Atribui coordenadas para exibição no mapa
-        with st.spinner("📍 Geocodificando localização dos imóveis..."):
-            todos_geo = _atribuir_coords(todos_items, lat, lon)
+        todos_geo = _atribuir_coords(todos_items, lat, lon)
         n = len(zap_r)
         st.session_state.zap_items     = todos_geo[:n]
         st.session_state.viva_items    = todos_geo[n:n + len(viva_r)]

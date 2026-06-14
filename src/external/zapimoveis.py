@@ -71,7 +71,7 @@ def _parse_int_from_name(name: str, pattern: str) -> int:
 
 
 def _bairro_from_name(name: str, cidade: str) -> str:
-    """Extrai bairro do título do anúncio: '... em Bairro Nome, Cidade'."""
+    """Extrai bairro do título do anúncio: '... em Bairro, Cidade'."""
     m = re.search(r"\bem\s+(.+?),\s*" + re.escape(cidade), name, re.IGNORECASE)
     if m:
         return m.group(1).strip().title()
@@ -166,10 +166,8 @@ def _normalizar_ld(entry: dict, portal: str) -> dict | None:
     quartos   = int(item.get("numberOfBedrooms") or 0)
     banheiros = int(item.get("numberOfBathroomsTotal") or 0)
 
-    # Vagas — não está no schema.org diretamente; extrai do título
     vagas = _parse_int_from_name(name, r"(\d+)\s*vaga")
 
-    # Foto principal
     images = item.get("image") or []
     thumb  = images[0] if images else ""
 
@@ -177,7 +175,6 @@ def _normalizar_ld(entry: dict, portal: str) -> dict | None:
     estado_uf  = addr.get("addressRegion") or ""
     bairro     = _bairro_from_name(name, cidade_raw)
 
-    # Estado por extenso (preferimos o nome completo para o modelo)
     _UF_INV = {v: k for k, v in _UF.items()}
     estado = _UF_INV.get(estado_uf.lower(), estado_uf)
 
@@ -217,16 +214,12 @@ def _url_zap(
     pagina: int = 1,
     bairro: str = "",
 ) -> str:
-    uf    = _UF.get(estado, "sp")
+    uf         = _UF.get(estado, "sp")
     tipo_slug  = _TIPO_ZAP.get(tipo, "imoveis")
     neg_slug   = _NEGOCIO_ZAP.get(negocio, "venda")
     cidade_slug = _slug(cidade)
-    base   = f"https://www.zapimoveis.com.br/{neg_slug}/{tipo_slug}/{uf}+{cidade_slug}/"
-    if bairro:
-        base += f"?bairros={_slug(bairro)}"
-        if pagina > 1:
-            base += f"&pagina={pagina}"
-    elif pagina > 1:
+    base = f"https://www.zapimoveis.com.br/{neg_slug}/{tipo_slug}/{uf}+{cidade_slug}/"
+    if pagina > 1:
         base += f"?pagina={pagina}"
     return base
 
@@ -239,11 +232,11 @@ def _url_viva(
     pagina: int = 1,
     bairro: str = "",
 ) -> str:
-    uf    = _UF.get(estado, "sp")
+    uf         = _UF.get(estado, "sp")
     tipo_slug  = _TIPO_VIVA.get(tipo, "apartamento_residencial")
     neg_slug   = _NEGOCIO_VIVA.get(negocio, "venda")
     cidade_slug = _slug(cidade)
-    base   = f"https://www.vivareal.com.br/{neg_slug}/{uf}/{cidade_slug}/{tipo_slug}/"
+    base = f"https://www.vivareal.com.br/{neg_slug}/{uf}/{cidade_slug}/{tipo_slug}/"
     if pagina > 1:
         base += f"?pagina={pagina}"
     return base
@@ -260,28 +253,20 @@ def buscar(
     limit: int = 24,
     pagina: int = 1,
     portal: str = "zap",
-    # parâmetros de filtro ignorados pelo scraper mas aceitos para compatibilidade
     quartos_min: int = 0,
     preco_min: float = 0,
     preco_max: float = 0,
     area_min: float = 0,
 ) -> list[dict]:
-    """
-    Busca imóveis via JSON-LD do ZAP Imóveis ou Viva Real.
-    Sem API key — dados públicos idênticos ao que o Google indexa.
-    """
+    """Busca imóveis via JSON-LD do ZAP Imóveis ou Viva Real (busca por cidade)."""
     tipos_use = tipos or ["apartment", "house"]
     results: list[dict] = []
-
     url_fn = _url_zap if portal == "zap" else _url_viva
 
     for tipo in tipos_use:
         if len(results) >= limit:
             break
-        url = url_fn(
-            cidade=cidade, estado=estado, tipo=tipo,
-            negocio=negocio, pagina=pagina, bairro=bairro,
-        )
+        url = url_fn(cidade=cidade, estado=estado, tipo=tipo, negocio=negocio, pagina=pagina)
         html = _fetch_html(url)
         if not html:
             time.sleep(0.5)
@@ -302,7 +287,7 @@ def buscar(
                 continue
             results.append(n)
 
-        time.sleep(0.3)  # respeita rate limit
+        time.sleep(0.3)
 
     return results[:limit]
 
