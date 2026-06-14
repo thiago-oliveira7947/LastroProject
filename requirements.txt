@@ -1,0 +1,21 @@
+# --- Machine Learning ---
+numpy
+pandas
+scikit-learn
+joblib
+
+# --- API ---
+fastapi
+uvicorn[standard]
+pydantic>=2
+
+# --- Interface / Busca ---
+streamlit>=1.32
+folium>=0.17
+streamlit-folium>=0.18
+
+# --- Utilidades / testes ---
+requests
+httpx
+pytest
+python-dotenv
