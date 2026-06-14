@@ -26,6 +26,7 @@ from src import config
 from src.external import mercadolivre as ml_api
 from src.external import zapimoveis
 from src.models.predict import carregar_metadata, carregar_modelo
+from src.search.engine import filtrar_por_poi, haversine_km
 from src.search.geocoder import geocode_com_fallback, geocode_detalhado
 from src.search.overpass import buscar_pois_localizacoes
 from src.search.query_parser import parse as parse_query
@@ -53,6 +54,12 @@ def _referer(url: str) -> str:
 def _img_cache() -> dict:
     """Singleton persistente entre re-runs — nunca zerado pelo Streamlit."""
     return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _buscar_pois_cached(lat: float, lon: float, raio_m: int, categorias_key: tuple) -> dict:
+    """Busca POIs no Overpass com cache de 1 hora por localização+categorias."""
+    return buscar_pois_localizacoes(lat, lon, raio_m, list(categorias_key))
 
 def _fetch_img_b64(url: str) -> str:
     """Baixa thumbnail com Referer correto, retorna data URI ou '' se falhar."""
@@ -687,16 +694,18 @@ def _buscar_tudo(
     def _viva():  return zapimoveis.buscar_vivareal(**kw)
     def _ml_pub():
         tipo_pt = TIPOS_PT.get(tipos[0], "") if tipos else ""
+        neg_kw = "aluguel" if negocio == "RENTAL" else ""
         q = " ".join(filter(None, [
-            tipo_pt, bairro or cidade,
+            neg_kw, tipo_pt, bairro or cidade,
             f"{quartos_min} quartos" if quartos_min else "",
         ]))
-        return ml_api.buscar_publico(q or cidade, limit=limit_por_fonte)
+        return ml_api.buscar_publico(q or cidade, limit=limit_por_fonte, negocio=negocio)
     def _ml_auth():
         if not ml_api.esta_autenticado():
             return []
         tipo_pt = TIPOS_PT.get(tipos[0], "") if tipos else ""
-        q = " ".join(filter(None, [tipo_pt, bairro or cidade]))
+        neg_kw = "aluguel" if negocio == "RENTAL" else ""
+        q = " ".join(filter(None, [neg_kw, tipo_pt, bairro or cidade]))
         return ml_api.buscar(q or cidade, limit=limit_por_fonte)
 
     results: dict[str, list[dict]] = {}
@@ -783,13 +792,18 @@ with st.sidebar:
         default=["apartment", "house"],
         format_func=lambda x: TIPOS_PT[x],
     )
-    quartos_r   = st.slider("Quartos",     0, 6, (1, 4))
-    banheiros_r = st.slider("Banheiros",   0, 6, (1, 4))
-    area_r      = st.slider("Área (m²)",  20, 600, (30, 350))
-    preco_r     = st.slider("Preço (R$)", 50_000, 5_000_000,
-                            (100_000, 2_500_000), step=50_000, format="R$ %d")
+    quartos_r   = st.slider("Quartos",     0, 6, (0, 6))
+    banheiros_r = st.slider("Banheiros",   0, 6, (0, 6))
+    area_r      = st.slider("Área (m²)",  20, 600, (20, 600))
+    if negocio_sel == "Aluguel":
+        preco_r = st.slider("Aluguel/mês (R$)", 300, 30_000,
+                            (300, 30_000), step=100, format="R$ %d",
+                            help="Valor mensal do aluguel")
+    else:
+        preco_r = st.slider("Preço (R$)", 50_000, 5_000_000,
+                            (50_000, 5_000_000), step=50_000, format="R$ %d")
     vagas_r     = st.slider("Vagas",       0, 6, (0, 4))
-    raio_km     = st.slider("Raio no mapa (km)", 1, 50, 15)
+    raio_km     = st.slider("Raio de busca (km)", 1, 50, 15, help="Filtra imóveis pela distância do centro da busca")
 
     st.divider()
     st.markdown("### 📍 Próximo a")
@@ -883,11 +897,9 @@ if buscar_btn and query.strip():
 
         pois_eff = list(set(pois_sidebar + (qp.poi_hints or [])))
         if pois_eff:
-            st.session_state.poi_locs = buscar_pois_localizacoes(
-                lat, lon, raio_km * 1000 + 2000, pois_eff
-            )
-        else:
-            st.session_state.poi_locs = {}
+            # Pré-aquece o cache para que _filtrar_poi não faça nova requisição
+            _buscar_pois_cached(lat, lon, int(raio_km * 1000 + 3000), tuple(sorted(pois_eff)))
+        st.session_state.poi_locs = {}  # mantido por compatibilidade, mas não mais usado por _filtrar_poi
 
         zap_r, viva_r, ml_pub_r, ml_auth_r = _buscar_tudo(
             cidade=cidade, estado=estado,
@@ -957,6 +969,8 @@ qp = st.session_state.qp
 def _filtrar(items: list[dict]) -> list[dict]:
     q_min, q_max = quartos_r
     b_min, b_max = banheiros_r
+    lat_c, lon_c = st.session_state.geocoded
+    check_raio = st.session_state.buscou
     out = []
     for i in items:
         if tipos_sel and i.get("tipo") not in tipos_sel:
@@ -979,20 +993,31 @@ def _filtrar(items: list[dict]) -> list[dict]:
             continue
         if negocio_api == "RENTAL" and neg == "SALE":
             continue
+        if check_raio:
+            item_lat = i.get("latitude")
+            item_lon = i.get("longitude")
+            if item_lat is not None and item_lon is not None:
+                if haversine_km(lat_c, lon_c, item_lat, item_lon) > raio_km:
+                    continue
         out.append(i)
     return out
 
 
 def _filtrar_poi(items: list[dict]) -> list[dict]:
     pois_eff = list(set(pois_sidebar + (qp.poi_hints if qp else [])))
-    if not pois_eff or not st.session_state.poi_locs or not items:
+    if not pois_eff or not items or not st.session_state.buscou:
         return items
-    from src.search.engine import filtrar_por_poi
+    lat_c, lon_c = st.session_state.geocoded
+    raio_m = int(raio_km * 1000 + 3000)
+    poi_locs = _buscar_pois_cached(lat_c, lon_c, raio_m, tuple(sorted(pois_eff)))
+    if not poi_locs:
+        return items
     df = pd.DataFrame(items)
     tem = df[df["latitude"].notna() & df["longitude"].notna()]
-    sem = df[df["latitude"].isna() | df["longitude"].isna()]
-    filtrado = filtrar_por_poi(tem, st.session_state.poi_locs, pois_eff, dist_poi)
-    return filtrado.to_dict("records") + sem.to_dict("records")
+    if tem.empty:
+        return items
+    filtrado = filtrar_por_poi(tem, poi_locs, pois_eff, dist_poi)
+    return filtrado.to_dict("records")
 
 
 zap_f      = _prever(_filtrar_poi(_filtrar(st.session_state.zap_items)))

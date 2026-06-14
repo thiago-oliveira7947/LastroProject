@@ -78,6 +78,79 @@ def _bairro_from_name(name: str, cidade: str) -> str:
     return ""
 
 
+# Palavras que aparecem nos slugs ZAP/Viva antes do bairro (features do imóvel).
+_FEATURE_WORDS = {
+    # transação / tipo de imóvel
+    "venda", "aluguel", "compra",
+    "apartamento", "apartamentos", "casa", "casas", "terreno", "terrenos",
+    "comercial", "comerciais", "flat", "studio", "cobertura", "coberturas",
+    "galpao", "loja", "lojas", "sala", "salas", "sobrado", "duplex", "triplex",
+    # cômodos / vagas (nunca fazem parte de nome de bairro)
+    "quarto", "quartos", "dormitorio", "dormitorios", "suite", "suites", "dorm",
+    "banheiro", "banheiros", "lavabo", "lavabos",
+    "vaga", "vagas", "garagem", "garagens",
+    # estado de mobília
+    "mobiliado", "mobiliada", "semimobiliado", "semimobiliada",
+    # conectores ambíguos (na URL geralmente precedem features, não bairro)
+    "com", "sem",
+    # amenidades (certamente features, não bairros)
+    "piscina", "churrasqueira", "sacada", "varanda", "quintal", "gourmet",
+    "elevador", "condominio", "garden",
+    # estados/características do imóvel — removidos "novo/nova/alto/area"
+    # pois são muito comuns em nomes de bairro (Vila Nova X, Alto da X)
+    "reformado", "reformada", "renovado", "renovada",
+    "andar", "andares",
+}
+
+
+def _bairro_from_url(url: str, cidade: str = "") -> str:
+    """Extrai bairro da URL do anúncio individual ZAP/Viva Real.
+
+    Estrutura do slug:
+      /imovel/{negocio}-{tipo}-{features}-{BAIRRO}-zona-{dir}-{cidade}-{uf}-{N}m2-id-{id}/
+
+    Âncoras usadas:
+    1. Antes de 'zona-{direção}' (São Paulo e capitais)
+    2. Antes de '{cidade_slug}-{uf}-{N}m2' (cidades sem zona)
+    """
+    m = re.search(r"/imovel/([^/?#]+)", url)
+    if not m:
+        return ""
+
+    slug = m.group(1).lower().rstrip("/")
+
+    def _extrair(before: str) -> str:
+        parts = before.rstrip("-").split("-")
+        bairro_parts: list[str] = []
+        for part in reversed(parts):
+            if not part:
+                continue
+            if re.search(r"\d", part):      # dígito → feature (quartos, área)
+                break
+            if part in _FEATURE_WORDS:      # palavra reservada → feature
+                break
+            bairro_parts.insert(0, part)
+        return " ".join(bairro_parts).title() if bairro_parts else ""
+
+    # Âncora 1: zona-{direção} (mais confiável, específica de SP)
+    zona_m = re.search(r"-(zona-(?:sul|norte|leste|oeste|centro|central))-", slug)
+    if zona_m:
+        bairro = _extrair(slug[: zona_m.start()])
+        if bairro:
+            return bairro
+
+    # Âncora 2: {cidade_slug}-{uf}-{digits}m2 (cidades sem zona)
+    if cidade:
+        cidade_slug = _slug(cidade)
+        city_m = re.search(rf"-{re.escape(cidade_slug)}-[a-z]{{2}}-\d+m2", slug)
+        if city_m:
+            bairro = _extrair(slug[: city_m.start()])
+            if bairro:
+                return bairro
+
+    return ""
+
+
 def _clean_text(text: str) -> str:
     """Remove caracteres de substituição Unicode (U+FFFD) e normaliza o texto."""
     # U+FFFD = replacement character (encoding mismatch residue)
@@ -173,7 +246,8 @@ def _normalizar_ld(entry: dict, portal: str) -> dict | None:
 
     cidade_raw = addr.get("addressLocality") or ""
     estado_uf  = addr.get("addressRegion") or ""
-    bairro     = _bairro_from_name(name, cidade_raw)
+    # URL tem precedência: o slug é gerado pelo portal (mais confiável que o título)
+    bairro = _bairro_from_url(url, cidade_raw) or _bairro_from_name(name, cidade_raw)
 
     _UF_INV = {v: k for k, v in _UF.items()}
     estado = _UF_INV.get(estado_uf.lower(), estado_uf)

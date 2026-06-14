@@ -130,6 +130,20 @@ def esta_autenticado() -> bool:
 
 # ─── Data helpers ─────────────────────────────────────────────────────────
 
+_RENTAL_WORDS = (
+    "aluguel", "alugar", "locação", "locacao", "para alugar", " alug.",
+    "mensalidade", "mensal",
+)
+
+
+def _inferir_negocio(raw: dict) -> str:
+    """Detecta se o anúncio é de aluguel ou venda pelo título."""
+    titulo = (raw.get("title") or "").lower()
+    if any(kw in titulo for kw in _RENTAL_WORDS):
+        return "RENTAL"
+    return "SALE"
+
+
 def _inferir_tipo(titulo: str) -> str:
     t = titulo.lower()
     for tipo, kws in _TIPO_HINTS.items():
@@ -195,21 +209,25 @@ def _normalizar(raw: dict) -> dict:
         "iptu":          0.0,
         "latitude":      float(loc["latitude"]) if loc.get("latitude") else None,
         "longitude":     float(loc["longitude"]) if loc.get("longitude") else None,
+        "negocio":       _inferir_negocio(raw),
         "fonte":         "mercadolivre",
     }
 
 
 # ─── Public API ───────────────────────────────────────────────────────────
 
-def buscar_publico(query: str, limit: int = 24) -> list[dict]:
+def buscar_publico(query: str, limit: int = 24, negocio: str = "SALE") -> list[dict]:
     """
     Busca imóveis no Mercado Livre sem autenticação (endpoint público).
     Retorna [] em caso de erro ou bloqueio.
     """
+    q = query
+    if negocio == "RENTAL" and "aluguel" not in q.lower():
+        q = f"aluguel {q}"
     try:
         r = requests.get(
             _SEARCH,
-            params={"q": query, "category": _CATEGORY,
+            params={"q": q, "category": _CATEGORY,
                     "limit": min(limit, 48), "sort": "relevance"},
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"},
             timeout=12,
